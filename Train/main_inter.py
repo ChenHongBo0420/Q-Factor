@@ -1,98 +1,160 @@
-from tqdm.autonotebook import tqdm
-import os,sys,humanize,psutil,GPUtil
+"""
+Refactored QC training script for ring resonator Qc prediction using attention-based or ResNet models.
+"""
+
+import os
 import time
-import math
 import random
+
+from typing import Tuple
+
 import numpy as np
-import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-from matplotlib.pyplot import imshow
-
-from numpy.linalg import inv
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from sklearn.metrics import mean_squared_error
-from sklearn.metrics import r2_score
-from sklearn.ensemble import RandomForestRegressor
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, random_split
+from tqdm.autonotebook import tqdm
 
-from Attention import RNN_Dataset, SmarterAttentionNet, train_network_reg, graph_results, return_true_pred, train_network_reg_mixup
+import humanize
+import psutil
+import GPUtil
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from Attention import RNN_Dataset, train_network_reg
 from util import rsnet18
-device = torch.device("cuda")
-Qc_Dataset = torch.load('Qc.pt')
-# Qc_Dataset = torch.load('Qc_3680_230.pt')
-# variables
-eta = 0.001            # learning rate
-step_size = 10         # Period of learning rate decay, see torch.optim.lr_scheduler.StepLR
-gamma = 0.5            # Multiplicative factor of learning rate decay. Default: 0.1
-epoch_no = 1    # number of epochs that will be used in training
-activation_f='ReLU'
-att_active_f='ReLU'
-optimizer_f = torch.optim.AdamW
+from sklearn.metrics import r2_score
 
-n_freq_training = 400   # number of frequencies will be used for training
-n_gap = 40           # number of frequencies between training and testing datasets
-input_dim=25     # attention mechanism input dimension
-num_neurons=256  # number of neurons to be used in the NN
-n_test = 1000     # testing dataset size
-num_layers= 5
-# features (we can't change these)
-n_feature = 4  # number of features describing the ring resonator
-nf = 601         # number of Qc values for each device
-fmax = 500       # max sim. frequency THz
-df = 0.5         # sim frequeny difference
-output_dim=nf-n_freq_training-n_gap
-T_length=n_feature+n_freq_training//input_dim
-fmin_test = fmax-df*(Qc_Dataset.shape[1]-n_feature-n_freq_training-n_gap)
-n_training_feature = n_feature+n_freq_training
-freqs = np.arange(fmin_test+df, fmax+df, df)
-# dataset_instance = RNN_Dataset(dataset=Qc_Dataset, n=n_freq_training, input_dim=input_dim, ngap=n_gap)
-# train_indices = list(range(0, Qc_Dataset.shape[0]-1000))
-# test_indices = list(range(Qc_Dataset.shape[0]-1000, Qc_Dataset.shape[0]))
-# train_data = Subset(dataset_instance, train_indices)
-# test_data = Subset(dataset_instance, test_indices)
-train_data, test_data = torch.utils.data.random_split(RNN_Dataset(dataset=Qc_Dataset,n=n_freq_training,input_dim=input_dim, ngap = n_gap), (Qc_Dataset.shape[0]-1000, 1000))
-train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
-test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
-# model = SmarterAttentionNet(T_length=T_length, input_dim=input_dim, num_neurons=num_neurons, output_dim=output_dim, activation=activation_f , att_active=att_active_f)
-model = rsnet18(num_classes=output_dim)
-# loss_func = nn.MSELoss()
-# model = NN()
-# model = recurrent_model(T_length=T_length, input_dim=input_dim,  num_layers=num_layers, num_neurons=num_neurons, output_dim=output_dim, model_type='RNN', bidirectional=False)
-print(model)
+# ---------------------- Configuration ----------------------
+# Device settings
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Hyperparameters
+ETA = 0.001            # Learning rate
+STEP_SIZE = 10         # LR decay period
+GAMMA = 0.5            # LR decay factor
+EPOCHS = 1             # Number of training epochs
+BATCH_SIZE = 32        # Batch size
+
+# Dataset parameters
+N_FREQ_TRAIN = 400     # Number of frequencies for training
+N_GAP = 40             # Frequency gap between train/test
+DATA_PATH = "Qc.pt"  # Path to the dataset file
+
+# Feature toggles
+ENABLE_PLOTTING = False  # Set True to display training plots
+
+# -------------------- Utility Functions --------------------
+
+def setup_environment():
+    """Print CPU and GPU memory usage."""
+    print(f"CPU RAM Free: {humanize.naturalsize(psutil.virtual_memory().available)}")
+    for gpu in GPUtil.getGPUs():
+        print(f"GPU {gpu.id}: {gpu.memoryUtil*100:.1f}% used")
+
+
+def load_dataset(path: str,
+                 n_freq_train: int,
+                 n_gap: int
+                 ) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset, int]:
+    """
+    Load the Qc dataset and split into training and test sets.
+
+    Returns:
+        train_ds: Training subset
+        test_ds: Testing subset
+        output_dim: Number of target frequencies to predict
+    """
+    data = torch.load(path)
+    total_samples, freq_count = data.shape
+    output_dim = freq_count - n_freq_train - n_gap
+    dataset = RNN_Dataset(dataset=data, n=n_freq_train, input_dim=None, ngap=n_gap)
+    train_size = total_samples - 1000
+    test_size = 1000
+    train_ds, test_ds = random_split(dataset, [train_size, test_size])
+    return train_ds, test_ds, output_dim
+
+
+def create_data_loaders(train_ds, test_ds, batch_size: int):
+    """Create PyTorch DataLoaders for train and test sets."""
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    return train_loader, test_loader
+
+
 class RMSELoss(nn.Module):
-    def __init__(self, eps=1e-6):
+    """Root-mean-square error loss."""
+    def __init__(self, eps: float = 1e-6):
         super().__init__()
         self.mse = nn.MSELoss()
         self.eps = eps
 
-    def forward(self, yhat, y):
-        return torch.sqrt(self.mse(yhat, y) + self.eps)
+    def forward(self, pred, target):
+        return torch.sqrt(self.mse(pred, target) + self.eps)
 
-loss_func = RMSELoss()
-optimizer = optimizer_f(model.parameters(), lr=eta)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
-start = time.time()
-results = train_network_reg(model, loss_func, train_loader, test_loader=test_loader, epochs=epoch_no,
-                                      score_funcs={'R^2 score': r2_score}, device=device, optimizer=optimizer, lr_schedule=scheduler)
-print(results)
-print(results.iloc[:, -2].max())
-print(results.iloc[:, -1].max())
-stop = time.time()
-print('Training time: %s sec' %(stop-start))
-sns.lineplot(x='epoch', y='test R^2 score', data=results[1:])
-plt.title('Test R^2 Score of the Additive Attention')
-plt.gcf().set_size_inches(10, 6)
-plt.show()
-# for i in range(1,n_test,499):
-#     graph_results(model, test_data,i,freqs)
-# df_true, df_pred = return_true_pred(model, test_data, 500, freqs)
-# df_true.to_csv('true_values.csv', index=False)
-# df_pred.to_csv('predicted_values.csv', index=False)
+
+def build_model(output_dim: int) -> nn.Module:
+    """Instantiate the model (ResNet or attention-based)."""
+    model = rsnet18(num_classes=output_dim)
+    return model.to(DEVICE)
+
+
+def train_and_evaluate(model: nn.Module,
+                       train_loader: DataLoader,
+                       test_loader: DataLoader
+                       ) -> "pd.DataFrame":
+    """
+    Train the model and evaluate on test set.
+
+    Returns:
+        results_df: DataFrame containing metrics per epoch
+    """
+    optimizer = torch.optim.AdamW(model.parameters(), lr=ETA)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=STEP_SIZE, gamma=GAMMA)
+    loss_fn = RMSELoss()
+
+    start_time = time.time()
+    results_df = train_network_reg(
+        model,
+        loss_fn,
+        train_loader,
+        test_loader=test_loader,
+        epochs=EPOCHS,
+        score_funcs={"R^2 score": r2_score},
+        device=DEVICE,
+        optimizer=optimizer,
+        lr_schedule=scheduler
+    )
+    elapsed = time.time() - start_time
+    print(f"Training time: {elapsed:.2f} sec")
+    return results_df
+
+
+def plot_results(results_df):
+    """Plot the test R^2 score over epochs."""
+    sns.lineplot(x="epoch", y="test R^2 score", data=results_df.iloc[1:])
+    plt.title("Test R^2 Score over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("R^2 Score")
+    plt.gcf().set_size_inches(10, 6)
+    plt.show()
+
+
+def main():
+    setup_environment()
+
+    train_ds, test_ds, output_dim = load_dataset(DATA_PATH, N_FREQ_TRAIN, N_GAP)
+    train_loader, test_loader = create_data_loaders(train_ds, test_ds, BATCH_SIZE)
+
+    model = build_model(output_dim)
+    print(model)
+
+    results = train_and_evaluate(model, train_loader, test_loader)
+    print("Max train R^2:", results["train R^2 score"].max())
+    print("Max test R^2:", results["test R^2 score"].max())
+
+    if ENABLE_PLOTTING:
+        plot_results(results)
+
+
+if __name__ == "__main__":
+    main()
